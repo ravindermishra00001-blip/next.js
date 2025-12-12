@@ -467,11 +467,11 @@ impl DiskFileSystemInner {
         if !already_created {
             let func = |p: &Path| std::fs::create_dir_all(p);
             retry_blocking(directory.to_path_buf(), func)
-                .concurrency_limited(&self.write_semaphore)
                 .instrument(tracing::info_span!(
                     "create directory",
                     name = display(directory.display())
                 ))
+                .concurrency_limited(&self.write_semaphore)
                 .await?;
             ApplyEffectsContext::with(|fs_context: &mut DiskFileSystemApplyContext| {
                 fs_context
@@ -680,11 +680,11 @@ impl FileSystem for DiskFileSystem {
 
         let _lock = self.inner.lock_path(&full_path).await;
         let content = match retry_blocking(full_path.clone(), |path: &Path| File::from_path(path))
-            .concurrency_limited(&self.inner.read_semaphore)
             .instrument(tracing::info_span!(
                 "read file",
                 name = display(full_path.display())
             ))
+            .concurrency_limited(&self.inner.read_semaphore)
             .await
         {
             Ok(file) => FileContent::new(file),
@@ -806,11 +806,11 @@ impl FileSystem for DiskFileSystem {
         let _lock = self.inner.lock_path(&full_path).await;
         let link_path =
             match retry_blocking(full_path.clone(), |path: &Path| std::fs::read_link(path))
-                .concurrency_limited(&self.inner.read_semaphore)
                 .instrument(tracing::info_span!(
                     "read symlink",
                     name = display(full_path.display())
                 ))
+                .concurrency_limited(&self.inner.read_semaphore)
                 .await
             {
                 Ok(res) => res,
@@ -928,11 +928,11 @@ impl FileSystem for DiskFileSystem {
             // not wasting cycles.
             let compare = content
                 .streaming_compare(&full_path)
-                .concurrency_limited(&inner.read_semaphore)
                 .instrument(tracing::info_span!(
                     "read file before write",
                     name = display(full_path.display())
                 ))
+                .concurrency_limited(&inner.read_semaphore)
                 .await?;
             if compare == FileComparison::Equal {
                 if !old_invalidators.is_empty() {
@@ -996,11 +996,11 @@ impl FileSystem for DiskFileSystem {
                         }
                         Ok::<(), io::Error>(())
                     })
-                    .concurrency_limited(&inner.write_semaphore)
                     .instrument(tracing::info_span!(
                         "write file",
                         name = display(full_path.display())
                     ))
+                    .concurrency_limited(&inner.write_semaphore)
                     .await
                     .with_context(|| format!("failed to write to {}", full_path.display()))?;
                 }
@@ -1008,11 +1008,11 @@ impl FileSystem for DiskFileSystem {
                     retry_blocking(full_path.clone().into_owned(), |path| {
                         std::fs::remove_file(path)
                     })
-                    .concurrency_limited(&inner.write_semaphore)
                     .instrument(tracing::info_span!(
                         "remove file",
                         name = display(full_path.display())
                     ))
+                    .concurrency_limited(&inner.write_semaphore)
                     .await
                     .or_else(|err| {
                         if err.kind() == ErrorKind::NotFound {
@@ -1111,11 +1111,11 @@ impl FileSystem for DiskFileSystem {
             let old_content = match retry_blocking(full_path.clone().into_owned(), |path| {
                 std::fs::read_link(path)
             })
-            .concurrency_limited(&inner.read_semaphore)
             .instrument(tracing::info_span!(
                 "read symlink before write",
                 name = display(full_path.display())
             ))
+            .concurrency_limited(&inner.read_semaphore)
             .await
             {
                 Ok(res) => Some((res.is_absolute(), res)),
@@ -1167,6 +1167,10 @@ impl FileSystem for DiskFileSystem {
                         // fails with EEXIST if the link already exists instead of overwriting it.
                         // Windows has similar behavior with junction points.
                         remove_symbolic_link_dir_helper(&full_path)
+                            .instrument(tracing::info_span!(
+                                "remove existing symlink before write",
+                                name = display(full_path.display())
+                            ))
                             .concurrency_limited(&inner.write_semaphore)
                             .await
                             .with_context(|| {
@@ -1174,6 +1178,8 @@ impl FileSystem for DiskFileSystem {
                             })?;
                     }
 
+                    let span =
+                        tracing::info_span!("create symlink", name = display(full_path.display()));
                     retry_blocking(target.clone(), move |target_path| {
                         let _span = tracing::info_span!(
                             "write symlink",
@@ -1193,6 +1199,8 @@ impl FileSystem for DiskFileSystem {
                             }
                         }
                     })
+                    .instrument(span)
+                    .concurrency_limited(&inner.write_semaphore)
                     .await
                     .with_context(|| {
                         #[cfg(not(windows))]
@@ -1215,6 +1223,10 @@ impl FileSystem for DiskFileSystem {
                 }
                 OsSpecificLinkContent::NotFound => {
                     remove_symbolic_link_dir_helper(&full_path)
+                        .instrument(tracing::info_span!(
+                            "remove symlink",
+                            name = display(full_path.display())
+                        ))
                         .concurrency_limited(&inner.write_semaphore)
                         .await
                         .with_context(|| anyhow!("removing {} failed", full_path.display()))?;
@@ -1243,11 +1255,11 @@ impl FileSystem for DiskFileSystem {
 
         let _lock = self.inner.lock_path(&full_path).await;
         let meta = retry_blocking(full_path.clone(), |path| std::fs::metadata(path))
-            .concurrency_limited(&self.inner.read_semaphore)
             .instrument(tracing::info_span!(
                 "read metadata",
                 name = display(full_path.display())
             ))
+            .concurrency_limited(&self.inner.read_semaphore)
             .await
             .with_context(|| format!("reading metadata for {}", full_path.display()))?;
 
