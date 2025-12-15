@@ -9,7 +9,10 @@ use turbo_tasks::{ResolvedVc, Vc};
 
 use crate::{
     module::Module,
-    module_graph::{GraphEdgeIndex, GraphTraversalAction, ModuleGraph},
+    module_graph::{
+        GraphEdgeIndex, GraphTraversalAction, ModuleGraph,
+        side_effect_module_info::compute_side_effect_free_module_info,
+    },
     reference::ModuleReference,
     resolve::{ExportUsage, ImportUsage},
 };
@@ -87,7 +90,7 @@ pub async fn compute_binding_usage_info(
     remove_unused_imports: bool,
 ) -> Result<Vc<BindingUsageInfo>> {
     let span_outer = tracing::info_span!(
-        "compute bindung usage info",
+        "compute binding usage info",
         visit_count = tracing::field::Empty,
         unused_reference_count = tracing::field::Empty
     );
@@ -122,11 +125,27 @@ pub async fn compute_binding_usage_info(
             );
         }
 
-        let graph = graph.read_graphs().await?;
+        let graph_ref = graph.read_graphs().await?;
 
-        let entries = graph.graphs.iter().flat_map(|g| g.entry_modules());
+        // Start computing side effect free modules early (before the first pass traversal) so
+        // it can run in parallel. This is an async operation that queries turbo tasks and
+        // benefits from early dispatch to reduce latency.
+        use once_cell::sync::Lazy;
+        static REMOVE_UNUSED_SIDE_EFFECTS: Lazy<bool> = Lazy::new(|| {
+            std::env::var_os("TURBOBPACK_REMOVE_UNUSED_SIDE_EFFECTS")
+                .is_some_and(|v| v == "1" || v == "true")
+        });
+        let side_effect_free_modules = if remove_unused_imports && *REMOVE_UNUSED_SIDE_EFFECTS {
+            let side_effect_free_modules = compute_side_effect_free_module_info(*graph).await?;
+            span.record("side_effect_free_modules", side_effect_free_modules.len());
+            Some(side_effect_free_modules)
+        } else {
+            None
+        };
 
-        let visit_count = graph.traverse_edges_fixed_point_with_priority(
+        let entries = graph_ref.graphs.iter().flat_map(|g| g.entry_modules());
+
+        let visit_count = graph_ref.traverse_edges_fixed_point_with_priority(
             entries.map(|m| (m, 0)),
             &mut (),
             |parent, target, _| {
@@ -137,6 +156,21 @@ pub async fn compute_binding_usage_info(
                 };
 
                 if remove_unused_imports {
+                    // If this is an export just being used for side effects, we can skip it if the
+                    // target is side effect free.
+                    if matches!(&ref_data.binding_usage.export, ExportUsage::Evaluation)
+                        && side_effect_free_modules.as_ref().unwrap().contains(&target)
+                    {
+                        #[cfg(debug_assertions)]
+                        debug_unused_references_name.insert((
+                            parent,
+                            ref_data.binding_usage.export.clone(),
+                            target,
+                        ));
+                        unused_references_edges.insert(edge);
+                        unused_references.insert(ref_data.reference);
+                        return Ok(GraphTraversalAction::Skip);
+                    }
                     // If the current edge is an unused import, skip it
                     match &ref_data.binding_usage.import {
                         ImportUsage::Exports(exports) => {
@@ -147,6 +181,7 @@ pub async fn compute_binding_usage_info(
                                 .iter()
                                 .all(|e| !source_used_exports.is_export_used(e))
                             {
+                                // all exports are unused
                                 #[cfg(debug_assertions)]
                                 debug_unused_references_name.insert((
                                     parent,
@@ -169,7 +204,7 @@ pub async fn compute_binding_usage_info(
                                 // Continue, add export
                             }
                         }
-                        ImportUsage::SideEffects => {
+                        ImportUsage::TopLevel => {
                             #[cfg(debug_assertions)]
                             debug_unused_references_name.remove(&(
                                 parent,
@@ -178,7 +213,6 @@ pub async fn compute_binding_usage_info(
                             ));
                             unused_references_edges.remove(&edge);
                             unused_references.remove(&ref_data.reference);
-                            // Continue, has to always be included
                         }
                     }
                 }
@@ -200,19 +234,22 @@ pub async fn compute_binding_usage_info(
         // A circuit breaker module will need to eagerly export lazy getters for its exports to
         // break an evaluation cycle all other modules can export values after defining them
         let mut export_circuit_breakers = FxHashSet::default();
-        graph.traverse_cycles(
-            |e| e.chunking_type.is_parallel(),
+        graph_ref.traverse_cycles(
+            // No need to traverse edges that are unused.
+            |e| e.chunking_type.is_parallel() && !unused_references.contains(&e.reference),
             |cycle| {
                 // To break cycles we need to ensure that no importing module can observe a
                 // partially populated exports object.
 
-                // We could compute this based on the module graph via a DFS from each entry point
-                // to the cycle.  Whatever node is hit first is an entry point to the cycle.
-                // (scope hoisting does something similar) and then we would only need to
-                // mark 'entry' modules (basically the targets of back edges in the export graph) as
-                // circuit breakers.  For now we just mark everything on the theory that cycles are
-                // rare.  For vercel-site on 8/22/2025 there were 106 cycles covering 800 modules
-                // (or 1.2% of all modules).  So with this analysis we could potentially drop 80% of
+                // We could compute this based on the module graph via a DFS from each entry
+                // point to the cycle.  Whatever node is hit first is an
+                // entry point to the cycle. (scope hoisting does something
+                // similar) and then we would only need to mark 'entry'
+                // modules (basically the targets of back edges in the export graph) as
+                // circuit breakers.  For now we just mark everything on the theory that cycles
+                // are rare.  For vercel-site on 8/22/2025 there were 106
+                // cycles covering 800 modules (or 1.2% of all modules).  So
+                // with this analysis we could potentially drop 80% of
                 // the cycle breaker modules.
                 export_circuit_breakers.extend(cycle.iter().map(|n| **n));
                 Ok(())
