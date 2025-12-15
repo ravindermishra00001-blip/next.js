@@ -126,16 +126,7 @@ pub async fn compute_binding_usage_info(
         }
 
         let graph_ref = graph.read_graphs().await?;
-
-        // Start computing side effect free modules early (before the first pass traversal) so
-        // it can run in parallel. This is an async operation that queries turbo tasks and
-        // benefits from early dispatch to reduce latency.
-        use once_cell::sync::Lazy;
-        static REMOVE_UNUSED_SIDE_EFFECTS: Lazy<bool> = Lazy::new(|| {
-            std::env::var_os("TURBOBPACK_REMOVE_UNUSED_SIDE_EFFECTS")
-                .is_some_and(|v| v == "1" || v == "true")
-        });
-        let side_effect_free_modules = if remove_unused_imports && *REMOVE_UNUSED_SIDE_EFFECTS {
+        let side_effect_free_modules = if remove_unused_imports {
             let side_effect_free_modules = compute_side_effect_free_module_info(*graph).await?;
             span.record("side_effect_free_modules", side_effect_free_modules.len());
             Some(side_effect_free_modules)
@@ -277,6 +268,41 @@ pub async fn compute_binding_usage_info(
                             e,
                             t.ident_string().await?,
                         )))
+                        .try_join()
+                        .await?
+                );
+                let total_modules: usize =
+                    graph_ref.graphs.iter().map(|g| g.number_of_modules).sum();
+                let mut reachable_modules = FxHashSet::default();
+                graph_ref.traverse_edges_dfs(
+                    graph_ref.graphs.iter().flat_map(|e| e.entry_modules()),
+                    &mut reachable_modules,
+                    |parent, n, s| {
+                        if parent.is_none()
+                            || !unused_references.contains(&parent.as_ref().unwrap().1.reference)
+                        {
+                            s.insert(n);
+                            Ok(GraphTraversalAction::Continue)
+                        } else {
+                            Ok(GraphTraversalAction::Skip)
+                        }
+                    },
+                    |_, _, _| Ok(()),
+                )?;
+                let unreachable_modules = graph_ref
+                    .graphs
+                    .iter()
+                    .flat_map(|g| g.enumerate_nodes().map(|(_index, node)| node.module()))
+                    .filter(|m| !reachable_modules.contains(m))
+                    .collect::<FxHashSet<_>>();
+                println!(
+                    "Removed {}/{total_modules} ({:.2}%) modules:\n{:#?}",
+                    unreachable_modules.len(),
+                    100.0 * unreachable_modules.len() as f64
+                        / (reachable_modules.len() + unreachable_modules.len()) as f64,
+                    unreachable_modules
+                        .iter()
+                        .map(|m| m.ident_string())
                         .try_join()
                         .await?
                 );
